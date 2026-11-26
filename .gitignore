@@ -222,3 +222,8 @@ _vizdoom.ini
 
 # Local validator / scorer artifacts
 *.lmp
+
+# Procedural WADs and training checkpoints (keep repo tiny)
+train/generated_wads/
+train/checkpoints/
+
