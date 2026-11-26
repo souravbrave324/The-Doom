@@ -70,6 +70,54 @@ def _extract_aux_and_metrics(infos: dict, num_envs: int) -> tuple[np.ndarray, li
     return aux, ep_done_metrics
 
 
+def _stack_obs_list(obs_list: list[dict], device: torch.device) -> dict:
+    return {
+        "vitals": torch.as_tensor(np.stack([o["vitals"] for o in obs_list]), dtype=torch.float32, device=device),
+        "rays": {
+            "distance": torch.as_tensor(np.stack([o["rays"]["distance"] for o in obs_list]), dtype=torch.float32, device=device),
+            "hit_type": torch.as_tensor(np.stack([o["rays"]["hit_type"] for o in obs_list]), dtype=torch.long, device=device),
+        },
+        "visible_entities": {
+            "features": torch.as_tensor(np.stack([o["visible_entities"]["features"] for o in obs_list]), dtype=torch.float32, device=device),
+            "entity_type": torch.as_tensor(np.stack([o["visible_entities"]["entity_type"] for o in obs_list]), dtype=torch.long, device=device),
+            "mask": torch.as_tensor(np.stack([o["visible_entities"]["mask"] for o in obs_list]), dtype=torch.float32, device=device),
+        },
+    }
+
+
+class RNDModule(nn.Module):
+    """Lightweight Random Network Distillation for intrinsic spatial exploration curiosity."""
+
+    def __init__(self, in_dim: int = VITALS_DIM + 2 * NUM_RAYS):
+        super().__init__()
+        self.target = nn.Sequential(nn.Linear(in_dim, 128), nn.GELU(), nn.Linear(128, 64))
+        for p in self.target.parameters():
+            p.requires_grad = False
+        self.predictor = nn.Sequential(
+            nn.Linear(in_dim, 128),
+            nn.GELU(),
+            nn.Linear(128, 128),
+            nn.GELU(),
+            nn.Linear(128, 64),
+        )
+
+    @staticmethod
+    def featurize(obs_t: dict) -> torch.Tensor:
+        vit = obs_t["vitals"].clone()
+        vit[..., :8] = (vit[..., :8] / 100.0).clamp(0.0, 2.5)
+        vit[..., 14:17] = (vit[..., 14:17] / 20.0).clamp(-2.5, 2.5)
+        rd = obs_t["rays"]["distance"]
+        rh = obs_t["rays"]["hit_type"].float() / 5.0
+        return torch.cat([vit, rd, rh], dim=-1)
+
+    def forward(self, obs_t: dict) -> torch.Tensor:
+        x = self.featurize(obs_t)
+        with torch.no_grad():
+            t = self.target(x)
+        p = self.predictor(x)
+        return ((p - t) ** 2).mean(dim=-1)
+
+
 def save_checkpoint(
     ckpt_dir: Path,
     model: nn.Module,
@@ -126,10 +174,17 @@ def train(args: argparse.Namespace) -> None:
     )
 
     model = DoomSpatialMemoryNet().to(device)
+    rnd = RNDModule().to(device)
     print(f"[Stage {args.stage}] Device={device} | Params={count_parameters(model):,} | Workers={args.num_envs} | WADs={len(wad_specs)}", flush=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, eps=1e-5, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        list(model.parameters()) + list(rnd.parameters()),
+        lr=args.lr,
+        eps=1e-5,
+        weight_decay=1e-4,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    rnd_ema_var = 1.0
 
     if args.init_from and Path(args.init_from).is_file():
         ckpt = torch.load(args.init_from, map_location=device, weights_only=True)
@@ -222,6 +277,33 @@ def train(args: argparse.Namespace) -> None:
                 next_obs_np, rewards_np, terms_np, truncs_np, infos = envs.step(act_np)
                 dones_np = np.logical_or(terms_np, truncs_np)
                 aux_np, ep_metrics_list = _extract_aux_and_metrics(infos, n_envs)
+
+                # RND intrinsic novelty reward (training-only exploration signal)
+                if args.rnd_coef > 0.0:
+                    with torch.inference_mode():
+                        rnd_err = rnd(obs_t).cpu().numpy()
+                    rnd_ema_var = 0.99 * rnd_ema_var + 0.01 * max(1e-6, float(np.var(rnd_err) + np.mean(rnd_err) ** 2))
+                    rnd_bonus = np.clip(args.rnd_coef * rnd_err / np.sqrt(rnd_ema_var), 0.0, 0.15).astype(np.float32)
+                    rewards_np = rewards_np + rnd_bonus
+
+                # Proper SAME_STEP truncation bootstrapping: add gamma * V(final_obs) when truncated & not terminated
+                trunc_only = np.logical_and(truncs_np, np.logical_not(terms_np))
+                if np.any(trunc_only) and "final_obs" in infos:
+                    has_fo = np.asarray(infos.get("_final_obs", np.zeros(n_envs, dtype=bool)), dtype=bool)
+                    t_idx = np.flatnonzero(np.logical_and(trunc_only, has_fo))
+                    if len(t_idx) > 0:
+                        fo_list = [infos["final_obs"][i] for i in t_idx]
+                        fo_t = _stack_obs_list(fo_list, device)
+                        t_idx_t = torch.as_tensor(t_idx, dtype=torch.long, device=device)
+                        trunc_mem = AgentMemoryState(
+                            gru_hidden=next_mem.gru_hidden[:, t_idx_t],
+                            ego_map=next_mem.ego_map[t_idx_t],
+                            latch=next_mem.latch[t_idx_t],
+                            prev_action=action[t_idx_t].float(),
+                        )
+                        with torch.inference_mode():
+                            _, t_vals, _, _ = model.forward_step(fo_t, trunc_mem)
+                        rewards_np[t_idx] = rewards_np[t_idx] + args.gamma * t_vals.cpu().numpy()
 
                 buf_rewards[step] = torch.from_numpy(rewards_np.astype(np.float32))
                 buf_dones[step] = torch.from_numpy(dones_np.astype(np.float32))
@@ -360,7 +442,15 @@ def train(args: argparse.Namespace) -> None:
                     v_loss = 0.5 * torch.max((new_values.float() - ret_mb) ** 2, (v_clipped - ret_mb) ** 2).mean()
 
                     aux_loss = F.binary_cross_entropy_with_logits(aux_logits.float(), aux_mb)
-                    loss = pg_loss + args.vf_coef * v_loss - ent_coef * entropy + args.aux_coef * aux_loss
+                    obs_rnd = {
+                        "vitals": obs_mb["vitals"].reshape(-1, VITALS_DIM),
+                        "rays": {
+                            "distance": obs_mb["rays"]["distance"].reshape(-1, NUM_RAYS),
+                            "hit_type": obs_mb["rays"]["hit_type"].reshape(-1, NUM_RAYS),
+                        },
+                    }
+                    rnd_loss = rnd(obs_rnd).mean() if args.rnd_coef > 0.0 else torch.zeros((), device=device)
+                    loss = pg_loss + args.vf_coef * v_loss - ent_coef * entropy + args.aux_coef * aux_loss + 0.5 * rnd_loss
 
                     optimizer.zero_grad(set_to_none=True)
                     scaler.scale(loss).backward()
@@ -430,6 +520,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--clip-coef", type=float, default=0.2, help="PPO clip coefficient")
     ap.add_argument("--vf-coef", type=float, default=0.5, help="Value loss weight")
     ap.add_argument("--aux-coef", type=float, default=0.2, help="Auxiliary BCE loss weight")
+    ap.add_argument("--rnd-coef", type=float, default=0.03, help="RND intrinsic curiosity reward scale")
     ap.add_argument("--ent-start", type=float, default=0.03, help="Initial entropy coefficient")
     ap.add_argument("--ent-end", type=float, default=0.005, help="Final entropy coefficient")
     ap.add_argument("--wad-episodes", type=int, default=32, help="Episodes per WAD before rotating")

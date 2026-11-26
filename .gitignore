@@ -226,4 +226,5 @@ _vizdoom.ini
 # Procedural WADs and training checkpoints (keep repo tiny)
 train/generated_wads/
 train/checkpoints/
+train/checkpoints_v2/
 

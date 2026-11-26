@@ -125,17 +125,19 @@ class DoomTrainingWrapper(gym.Wrapper):
         self._prev_keys_sum = 0.0
         self._prev_kills = 0
         self._prev_damage = 0.0
+        self._prev_items = 0
         self._prev_ammo = 0.0
         self._prev_ceil: np.ndarray | None = None
         self._prev_action = np.zeros(len(S.BUTTONS), dtype=np.int8)
         self._key_seen = False
         self._locked_seen = False
+        self._post_key_locked_bonus = False
         self._pos_history: list[tuple[float, float]] = []
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         st = self.env.unwrapped.privileged_state()
-        self._visited_cells = {(int(st["x"] // 128), int(st["y"] // 128))}
+        self._visited_cells = {(int(st["x"] // 96), int(st["y"] // 96))}
         self._opened_doors = set()
         self._opened_locked = set()
         self._prev_keys_sum = float(np.sum(st["keys"]))
@@ -147,6 +149,7 @@ class DoomTrainingWrapper(gym.Wrapper):
         self._prev_action = np.zeros(len(S.BUTTONS), dtype=np.int8)
         self._key_seen = False
         self._locked_seen = False
+        self._post_key_locked_bonus = False
         self._pos_history = [(st["x"], st["y"])]
 
         s_obs = strip_pixels(obs)
@@ -164,8 +167,8 @@ class DoomTrainingWrapper(gym.Wrapper):
 
         reward = -0.004  # step penalty
 
-        # 1. Exploration: +0.05 per new 128x128 grid cell
-        cell = (int(st["x"] // 128), int(st["y"] // 128))
+        # 1. Exploration: +cell_bonus per new 96x96 grid cell
+        cell = (int(st["x"] // 96), int(st["y"] // 96))
         if cell not in self._visited_cells:
             self._visited_cells.add(cell)
             reward += self.cell_bonus
@@ -177,11 +180,15 @@ class DoomTrainingWrapper(gym.Wrapper):
             if ((st["x"] - ox) ** 2 + (st["y"] - oy) ** 2) < 16.0**2:
                 reward -= self.stall_penalty
 
-        # 2. Keycard pickup (+2.5 per key)
+        # 2. Keycard pickup (+3.0 per key) & post-keycard locked-door sighting
         keys_sum = float(np.sum(st["keys"]))
         if keys_sum > self._prev_keys_sum:
-            reward += 2.5 * (keys_sum - self._prev_keys_sum)
+            reward += 3.0 * (keys_sum - self._prev_keys_sum)
         self._prev_keys_sum = keys_sum
+        if keys_sum > 0.5 and not self._post_key_locked_bonus:
+            if np.any(s_obs["rays"]["hit_type"] == RAY_LOCKED):
+                self._post_key_locked_bonus = True
+                reward += 0.6
 
         # 3. Doors & locked doors opening
         ceil = st["sector_ceiling"]
@@ -192,7 +199,7 @@ class DoomTrainingWrapper(gym.Wrapper):
                 sid_i = int(sid)
                 if dlock[sid_i] > 0 and sid_i not in self._opened_locked:
                     self._opened_locked.add(sid_i)
-                    reward += 2.5
+                    reward += 4.0
                 elif dlock[sid_i] == 0 and sid_i not in self._opened_doors:
                     self._opened_doors.add(sid_i)
                     reward += 0.5
@@ -369,23 +376,30 @@ def build_stage_wad_specs(wad_root: str | Path, stage: str) -> tuple[list[tuple[
             specs.append((str(p), "MAP01", 2400))
             weights.append(0.20)
     elif stage == "4":
-        t4 = sorted((root / "tier4").glob("*.wad"))
+        t1 = sorted((root / "tier1").glob("*.wad"))
+        t2 = sorted((root / "tier2").glob("*.wad"))
         t3 = sorted((root / "tier3").glob("*.wad"))
-        for p in t4:
-            specs.append((str(p), "MAP01", 3600))
-            weights.append(0.70 / max(1, len(t4)))
+        t4 = sorted((root / "tier4").glob("*.wad"))
+        for p in t1:
+            specs.append((str(p), "MAP01", 2100))
+            weights.append(0.15 / max(1, len(t1)))
+        for p in t2:
+            specs.append((str(p), "MAP01", 2400))
+            weights.append(0.20 / max(1, len(t2)))
         for p in t3:
             specs.append((str(p), "MAP01", 3200))
-            weights.append(0.10 / max(1, len(t3)))
-        # Mix 20% standard Freedoom 2 maps (MAP01..MAP06) for domain generalization
-        import os
+            weights.append(0.30 / max(1, len(t3)))
+        for p in t4:
+            specs.append((str(p), "MAP01", 3600))
+            weights.append(0.30 / max(1, len(t4)))
+        # Mix 5% standard Freedoom 2 maps (MAP01..MAP06) for domain generalization without diluting exits
         import vizdoom as vd
         iwad = os.path.join(os.path.dirname(vd.__file__), "freedoom2.wad")
         if Path(iwad).is_file():
             fd_maps = ["MAP01", "MAP02", "MAP03", "MAP04", "MAP05", "MAP06"]
             for m in fd_maps:
                 specs.append((iwad, m, 3600))
-                weights.append(0.20 / len(fd_maps))
+                weights.append(0.05 / len(fd_maps))
     elif stage == "all":
         for idx, ticks in ((1, 2100), (2, 2400), (3, 3200), (4, 3600)):
             for p in sorted((root / f"tier{idx}").glob("*.wad")):
