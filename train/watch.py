@@ -60,23 +60,40 @@ def _ego_map_to_surface(ego_map: np.ndarray, size: int = 240) -> pygame.Surface:
     return pygame.transform.scale(surf, (size, size))
 
 
-def watch(args: argparse.Namespace) -> None:
+def _build_playlist(args: argparse.Namespace) -> list[tuple[str, str, int]]:
+    if args.tour:
+        iwad = os.path.join(os.path.dirname(vd.__file__), "freedoom2.wad")
+        playlist = [
+            ("maps/two_rooms.wad", "MAP01", 2100),
+            ("train/generated_wads/tier1/tier1_combat_000.wad", "MAP01", 2100),
+            ("train/generated_wads/tier2/tier2_doors_000.wad", "MAP01", 2400),
+            ("train/generated_wads/tier3/tier3_keycard_000.wad", "MAP01", 3200),
+            ("train/generated_wads/tier4/tier4_gauntlet_000.wad", "MAP01", 3600),
+        ]
+        if Path(iwad).is_file():
+            playlist.append((iwad, "MAP01", 4200))
+        return [(w, m, t) for w, m, t in playlist if Path(w).is_file()]
     if args.freedoom:
-        wad_path = os.path.join(os.path.dirname(vd.__file__), "freedoom2.wad")
-        map_name = args.freedoom.upper()
-    else:
-        wad_str, _, mname = args.map.partition(":")
-        wad_path = wad_str
-        map_name = (mname or "MAP01").upper()
+        iwad = os.path.join(os.path.dirname(vd.__file__), "freedoom2.wad")
+        return [(iwad, args.freedoom.upper(), args.ticks)] * args.episodes
+    wad_str, _, mname = args.map.partition(":")
+    return [(wad_str, (mname or "MAP01").upper(), args.ticks)] * args.episodes
+
+
+def watch(args: argparse.Namespace) -> None:
+    playlist = _build_playlist(args)
+    if not playlist:
+        raise FileNotFoundError("No valid WADs found for playlist")
 
     device = "cuda" if (args.device == "auto" and torch.cuda.is_available()) else ("cpu" if args.device == "auto" else args.device)
-    env = make_env(wad_path, map_name, episode_ticks=args.ticks, render_buffers=True)
-    agent = DoomAgent(env.observation_space, env.action_space, device)
+    probe_env = make_env(playlist[0][0], playlist[0][1], episode_ticks=playlist[0][2], render_buffers=False)
+    agent = DoomAgent(probe_env.observation_space, probe_env.action_space, device)
+    probe_env.close()
 
     if not args.no_window:
         pygame.init()
         screen = pygame.display.set_mode((980, 520))
-        pygame.display.set_caption(f"DoomSpatialMemoryNet — {Path(wad_path).name}:{map_name}")
+        pygame.display.set_caption("DoomSpatialMemoryNet — Live Demo")
         font = pygame.font.SysFont("consolas", 15)
         font_b = pygame.font.SysFont("consolas", 17, bold=True)
         clock = pygame.time.Clock()
@@ -86,8 +103,16 @@ def watch(args: argparse.Namespace) -> None:
     if args.save_dir:
         Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
+    cur_env = None
+    cur_key = None
     try:
-        for ep in range(args.episodes):
+        for ep, (wad_path, map_name, ep_ticks) in enumerate(playlist):
+            if cur_env is None or cur_key != (wad_path, map_name, ep_ticks):
+                if cur_env is not None:
+                    cur_env.close()
+                cur_env = make_env(wad_path, map_name, episode_ticks=ep_ticks, render_buffers=True)
+                cur_key = (wad_path, map_name, ep_ticks)
+            env = cur_env
             obs, info = env.reset(seed=args.seed + ep)
             agent.reset()
             step = 0
@@ -104,7 +129,6 @@ def watch(args: argparse.Namespace) -> None:
                 action = agent.act(obs)
                 lat_ms = (time.perf_counter() - t0) * 1000.0
 
-                # Grab auxiliary head predictions directly from current GRU hidden state
                 with torch.inference_mode():
                     aux_probs = torch.sigmoid(agent.model.aux_head(agent._mem.gru_hidden.squeeze(0)))[0].detach().cpu().numpy()
 
@@ -114,26 +138,23 @@ def watch(args: argparse.Namespace) -> None:
 
                 if not args.no_window:
                     screen.fill((14, 16, 22))
-                    # Left: DOOM RGB gameplay upscaled (640x480)
-                    rgb = obs["rgb"]  # (120, 160, 3)
+                    rgb = obs["rgb"]
                     game_surf = pygame.surfarray.make_surface(np.transpose(rgb, (1, 0, 2)))
                     game_surf = pygame.transform.scale(game_surf, (640, 480))
                     screen.blit(game_surf, (16, 20))
 
-                    # Right panel: 24x24 Ego-Map + Stats
                     ego_np = agent._mem.ego_map[0].detach().cpu().numpy()
                     ego_surf = _ego_map_to_surface(ego_np, size=240)
                     screen.blit(ego_surf, (690, 44))
                     pygame.draw.rect(screen, (90, 95, 110), (690, 44, 240, 240), 1)
-                    # Draw player arrow at ego-map center
                     pygame.draw.polygon(screen, (255, 255, 255), [(810, 156), (805, 170), (815, 170)])
                     screen.blit(font_b.render("24x24 Neural Ego-Map", True, (220, 230, 245)), (690, 20))
 
                     y = 296
                     keys_held = int(np.sum(obs["vitals"][8:14]) > 0.5)
                     lines = [
-                        f"Map: {Path(wad_path).name}:{map_name} (ep {ep+1})",
-                        f"Step: {step} | Tic: {st['tic']}/{args.ticks} | {lat_ms:.1f}ms",
+                        f"Map: {Path(wad_path).name}:{map_name} ({ep+1}/{len(playlist)})",
+                        f"Step: {step} | Tic: {st['tic']}/{ep_ticks} | {lat_ms:.1f}ms",
                         f"HP: {st['health']:.0f} | Kills: {st['kills']} | Key: {'YES' if keys_held else 'NO'}",
                         f"Aux Threat: {aux_probs[0]:.2f} | Key: {aux_probs[1]:.2f} | Lock: {aux_probs[2]:.2f}",
                     ]
@@ -141,7 +162,6 @@ def watch(args: argparse.Namespace) -> None:
                         screen.blit(font.render(ln, True, (210, 215, 225)), (674, y))
                         y += 22
 
-                    # Action pills
                     btn_names = ["FWD", "BCK", "L", "R", "TL", "TR", "ATK", "USE", "WPN"]
                     bx = 674
                     for i, bname in enumerate(btn_names):
@@ -158,12 +178,13 @@ def watch(args: argparse.Namespace) -> None:
 
                 if term or trunc:
                     outcome = "EXIT REACHED!" if info.get("exit_reached") else ("DIED" if st["dead"] else "TIME UP")
-                    print(f"Episode {ep+1}: {outcome} | steps={step} | kills={st['kills']} | tic={st['tic']}", flush=True)
+                    print(f"[{Path(wad_path).name}:{map_name}] {outcome} | steps={step} | kills={st['kills']}", flush=True)
                     if not args.no_window:
                         time.sleep(1.2)
                     break
     finally:
-        env.close()
+        if cur_env is not None:
+            cur_env.close()
         if not args.no_window:
             pygame.quit()
 
@@ -172,6 +193,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Watch DoomAgent play DOOM live with neural Ego-Map HUD")
     ap.add_argument("--map", default="maps/two_rooms.wad:MAP01", help="WAD[:MAP] to play")
     ap.add_argument("--freedoom", default="", help="Optional Freedoom2 map name (e.g. MAP01)")
+    ap.add_argument("--tour", action="store_true", help="Play multi-tier + Freedoom2 showcase tour")
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--ticks", type=int, default=2100)
     ap.add_argument("--fps", type=int, default=12, help="Playback decisions/sec (8.75 is real-time)")
